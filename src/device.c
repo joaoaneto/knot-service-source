@@ -154,22 +154,24 @@ static struct l_dbus_message *method_forget(struct l_dbus *dbus,
 	if (device->msg)
 		return dbus_error_busy(msg);
 
-	/* FIXME: potential race condition. Registration might be in progress */
-
-	/* Registered to cloud ? */
-	if (device->uuid)
-		proto_rmnode_by_uuid(device->uuid);
-
 	device->msg = l_dbus_message_ref(msg);
 
 	ellproxy = proxy_get(device->id);
 	if (!ellproxy)
 		return dbus_error_not_available(msg);
 
-	device->msg_id = l_dbus_proxy_method_call(ellproxy, "Forget", NULL,
-						  method_reply, device, NULL);
+	/* FIXME: potential race condition. Registration might be in progress */
 
-	return NULL;
+	/* Registered to cloud ? */
+	if (device->uuid) {
+		proto_rmnode_by_uuid(device->uuid);
+	} else {
+		device->msg_id = l_dbus_proxy_method_call(ellproxy, "Forget",
+					NULL, method_reply, device, NULL);
+		return NULL;
+	}
+
+	return l_dbus_message_new_method_return(msg);
 }
 
 static bool property_get_name(struct l_dbus *dbus,
