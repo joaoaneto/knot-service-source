@@ -147,6 +147,7 @@ static struct l_dbus_message *method_forget(struct l_dbus *dbus,
 {
 	struct knot_device *device = user_data;
 	struct l_dbus_proxy *ellproxy;
+	struct l_dbus_message *reply;
 
 	if (!device->paired)
 		return dbus_error_not_available(msg);
@@ -165,11 +166,17 @@ static struct l_dbus_message *method_forget(struct l_dbus *dbus,
 	ellproxy = proxy_get(device->id);
 	if (!ellproxy)
 		return dbus_error_not_available(msg);
+	
+	hal_log_info("method_forget()");
 
-	device->msg_id = l_dbus_proxy_method_call(ellproxy, "Forget", NULL,
-						  method_reply, device, NULL);
+	//device->msg_id = l_dbus_proxy_method_call(ellproxy, "Forget", NULL,
+	//						  method_reply, device, NULL);
 
-	return NULL;
+	reply = l_dbus_message_new_method_return(msg);
+	l_dbus_message_set_arguments(reply, "");
+
+	return reply;
+	//return NULL;
 }
 
 static bool property_get_name(struct l_dbus *dbus,
@@ -320,7 +327,6 @@ struct knot_device *device_create(const char *id, const char *name,
 	struct knot_device *device;
 
 	device = l_new(struct knot_device, 1);
-	device->refs = 0;
 	device->id = l_strdup(id);
 	device->name = l_strdup(name);
 	device->uuid = NULL; /* FIXME */

@@ -77,8 +77,7 @@ struct session {
 	json_object *setdata_jso;	/* JSON object representing set_data */
 };
 
-/* Maps sockets to sessions: online devices only.  */
-static struct l_hashmap *session_map;
+static struct l_queue *session_list;
 static struct l_queue *device_id_list;
 static struct l_timeout *start_to;
 static const char *owner_uuid;
@@ -206,6 +205,30 @@ static bool config_sensor_id_cmp(const void *entry_data, const void *user_data)
 	return config->sensor_id == sensor_id;
 }
 
+static bool session_node_fd_cmp(const void *entry_data, const void *user_data)
+{
+	const struct session *session = entry_data;
+	int node_fd = L_PTR_TO_INT(user_data);
+
+	return session->node_fd == node_fd;
+}
+
+static bool session_uuid_cmp(const void *entry_data, const void *user_data)
+{
+	const struct session *session = entry_data;
+	const char *uuid = user_data;
+
+	return strcmp(session->uuid, uuid) == 0 ? true : false;
+}
+
+static bool session_id_cmp(const void *entry_data, const void *user_data)
+{
+	const struct session *session = entry_data;
+	const char *id = user_data;
+
+	return session->id == strtoull(id, NULL, 16);
+}
+
 static void downstream_callback(struct l_timeout *timeout, void *user_data)
 {
 	struct session *session = user_data;
@@ -277,8 +300,7 @@ static bool property_changed(const char *name,
 	char id[KNOT_ID_LEN + 1];
 
 	/* FIXME: manage link overload or not connected */
-
-	session = l_hashmap_lookup(session_map, user_data);
+	session = l_queue_find(session_list, session_node_fd_cmp, user_data);
 	if (!session)
 		return false;
 
@@ -466,6 +488,38 @@ static int8_t msg_unregister(struct session *session)
 	session_unref(session);
 
 	return KNOT_SUCCESS;
+}
+
+static bool msg_unregister_req(void *user_data)
+{
+	knot_msg_unregister kmunreg;
+	struct session *session;
+	struct node_ops *node_ops;
+	struct mydevice *mydevice = user_data;
+	ssize_t olen, osent;
+	void *opdu;
+	int err = 0;
+
+	session = l_queue_find(session_list, session_uuid_cmp, mydevice->uuid);
+	if (!session)
+		return false;
+
+	node_ops = session->node_ops;
+
+	kmunreg.hdr.type = KNOT_MSG_UNREGISTER_REQ;
+	kmunreg.hdr.payload_len = 0;
+	olen = sizeof(knot_msg_unregister) + kmunreg.hdr.payload_len;
+	opdu = &kmunreg;
+
+	osent = node_ops->send(session->node_fd, opdu, olen);
+	if (osent < 0) {
+		err = -osent;
+		hal_log_error("Can't send unregister message: %s(%d)",
+				strerror(err), err);
+		return false;
+	}
+
+	return true;
 }
 
 /* Mandatory before any operation */
@@ -771,6 +825,29 @@ done:
 	return result;
 }
 
+static int8_t msg_unregister_resp(struct session *session)
+{
+	struct mydevice *mydevice = l_queue_find(device_id_list,
+						 device_uuid_cmp,
+						 session->uuid);
+	struct knot_device *device = device_get(mydevice->id);
+
+	hal_log_info("unregister response arrives!!");
+
+	if (device_forget(device))
+		hal_log_info("Proxy for %s removed", mydevice->id);
+	else
+		hal_log_info("Can't remove proxy for %s" , mydevice->id);
+
+	mydevice = l_queue_remove_if(device_id_list, device_id_cmp,
+			mydevice->id);
+
+	device_destroy(mydevice->id);
+	mydevice_free(mydevice);
+
+	return KNOT_SUCCESS;
+}
+
 static ssize_t msg_process(struct session *session,
 				const void *ipdu, size_t ilen,
 				void *opdu, size_t omtu)
@@ -853,6 +930,9 @@ static ssize_t msg_process(struct session *session,
 		return 0;
 	case KNOT_MSG_DATA_RESP:
 		result = msg_setdata_resp(session, &kreq->data);
+		return 0;
+	case KNOT_MSG_UNREGISTER_RESP:
+		result = msg_unregister_resp(session);
 		return 0;
 	default:
 		/* TODO: reply unknown command */
@@ -965,7 +1045,9 @@ static void session_node_disconnected_cb(struct l_io *channel, void *user_data)
 	struct session *session = user_data;
 
 	/* ELL returns -1 when calling l_io_get_fd() at disconnected callback */
-	session = l_hashmap_remove(session_map, L_INT_TO_PTR(session->node_fd));
+	session = l_queue_remove_if(session_list,
+				    session_node_fd_cmp,
+				    L_INT_TO_PTR(session->node_fd));
 
 	session_proto_disconnect(session);
 	session_destroy(session);
@@ -1104,7 +1186,7 @@ static bool session_accept_cb(struct node_ops *node_ops, int client_socket)
 		return false;
 	}
 
-	l_hashmap_insert(session_map, L_INT_TO_PTR(client_socket), session);
+	l_queue_push_head(session_list, session);
 
 	return true;
 }
@@ -1154,7 +1236,9 @@ static void proxy_added(const char *device_id, const char *uuid,
 static void proxy_removed(const char *device_id, void *user_data)
 {
 	struct knot_device *device = device_get(device_id);
-	struct mydevice *mydevice;
+	struct mydevice *mydevice = l_queue_find(device_id_list,
+						 device_id_cmp,
+						 device_id);
 
 	/* Tracks 'proxy' devices removed from Cloud. */
 	if (device == NULL) {
@@ -1163,14 +1247,11 @@ static void proxy_removed(const char *device_id, void *user_data)
 		return;
 	}
 
-	if (device_forget(device))
-		hal_log_info("Proxy for %s removed", device_id);
+	/* Send unregister request to device */
+	if(msg_unregister_req(mydevice))
+		hal_log_info("Sending unregister message ...");
 	else
-		hal_log_info("Can't remove proxy for %s" , device_id);
-
-	mydevice = l_queue_remove_if(device_id_list, device_id_cmp, device_id);
-	device_destroy(device_id);
-	mydevice_free(mydevice);
+		hal_log_info("Unregister message can't be sent!!");
 }
 
 static void service_ready(const char *service, void *user_data)
@@ -1234,6 +1315,7 @@ signin_fail:
 	proto_close(sock);
 
 connect_fail:
+	hal_log_info("test");
 	/* Schedule this callback to 5 seconds */
 	l_timeout_modify(timeout, 5);
 }
@@ -1242,7 +1324,7 @@ int msg_start(struct settings *settings)
 {
 	int err;
 
-	session_map = l_hashmap_new();
+	session_list = l_queue_new();
 
 	err = device_start();
 	if (err < 0) {
@@ -1280,6 +1362,6 @@ void msg_stop(void)
 
 	l_queue_destroy(device_id_list, mydevice_free);
 
-	l_hashmap_destroy(session_map,
-			  (l_hashmap_destroy_func_t) session_unref);
+	l_queue_destroy(session_list,
+			(l_queue_destroy_func_t) session_unref);
 }
