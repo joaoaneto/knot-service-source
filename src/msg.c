@@ -860,12 +860,14 @@ done:
 	return result;
 }
 
-static int8_t msg_unregister_resp(struct session *session)
+static void device_forget_destroy(struct mydevice *mydevice)
 {
-	struct mydevice *mydevice = l_queue_find(device_id_list,
-						 device_uuid_cmp,
-						 session->uuid);
-	struct knot_device *device = device_get(mydevice->id);
+	struct knot_device *device;
+
+	if (!mydevice)
+		return;
+
+	device = device_get(mydevice->id);
 
 	if (device_forget(device))
 		hal_log_info("Proxy for %s removed", mydevice->id);
@@ -877,6 +879,15 @@ static int8_t msg_unregister_resp(struct session *session)
 
 	device_destroy(mydevice->id);
 	mydevice_free(mydevice);
+}
+
+static int8_t msg_unregister_resp(struct session *session)
+{
+	struct mydevice *mydevice = l_queue_find(device_id_list,
+						 device_uuid_cmp,
+						 session->uuid);
+
+	device_forget_destroy(mydevice);
 
 	return KNOT_SUCCESS;
 }
@@ -1265,6 +1276,14 @@ static void proxy_added(const char *device_id, const char *uuid,
 	l_queue_push_head(device_id_list, mydevice);
 }
 
+static void unregister_callback(struct l_timeout *timeout, void *user_data)
+{
+	struct mydevice *mydevice = user_data;
+
+	if (l_queue_find(device_id_list, device_id_cmp, mydevice->id))
+		device_forget_destroy(mydevice);
+}
+
 static void proxy_removed(const char *device_id, void *user_data)
 {
 	struct knot_device *device = device_get(device_id);
@@ -1282,21 +1301,16 @@ static void proxy_removed(const char *device_id, void *user_data)
 	/* Send unregister request to device */
 	if(msg_unregister_req(mydevice)) {
 		hal_log_info("Sending unregister message ...");
+		/* Start unregister timeout */
+		l_timeout_create_ms(1096,
+				    unregister_callback,
+				    mydevice, NULL);
 		return;
 	}
 
 	hal_log_info("Unregister message can't be sent!!");
 
-	if (device_forget(device))
-		hal_log_info("Proxy for %s removed", mydevice->id);
-	else
-		hal_log_info("Can't remove proxy for %s" , mydevice->id);
-
-	mydevice = l_queue_remove_if(device_id_list, device_id_cmp,
-			mydevice->id);
-
-	device_destroy(mydevice->id);
-	mydevice_free(mydevice);
+	device_forget_destroy(mydevice);
 }
 
 static void service_ready(const char *service, void *user_data)
