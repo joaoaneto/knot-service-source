@@ -596,6 +596,8 @@ static int callback_lws_ws(struct lws *wsi,
 		parse(session, in, len);
 		break;
 	case LWS_CALLBACK_CLIENT_CONNECTION_ERROR:
+		hal_log_info("WSI: %p connection error", wsi);
+		hal_log_info("Host may be invalid or unreachable");
 		break;
 	case LWS_CALLBACK_WSI_CREATE: // always protocol[0]
 		hal_log_info("WSI: %p created", wsi);
@@ -720,6 +722,9 @@ static int ws_connect(void)
 	info.userdata = NULL;
 
 	ws = lws_client_connect_via_info(&info);
+
+	if (!ws)
+		return -1;
 
 	sock = lws_get_socket_fd(ws);
 	l_hashmap_insert(lws_list, L_INT_TO_PTR(sock), ws);
